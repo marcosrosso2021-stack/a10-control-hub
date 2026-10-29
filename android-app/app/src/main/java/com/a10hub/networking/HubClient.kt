@@ -18,6 +18,20 @@ enum class ConnState { DISCONNECTED, CONNECTING, PAIRING, READY, ERROR }
 /** Action autorisée annoncée par le PC (identifiant + libellé ; rien d'exécutable ne transite). */
 data class ActionItem(val id: String, val label: String, val sensitive: Boolean, val page: String)
 
+data class DiskInfo(val mount: String, val percent: Double, val freeGb: Double, val totalGb: Double)
+data class ProcInfo(val name: String, val cpu: Double, val memMb: Int)
+
+/** Instantané des statistiques du PC. Batterie et température sont nulles si le PC n'en expose pas. */
+data class PcStats(
+    val cpu: Double, val cores: Int,
+    val memPercent: Double, val memUsedMb: Int, val memTotalMb: Int,
+    val disks: List<DiskInfo>,
+    val upKbps: Double, val downKbps: Double,
+    val batteryPercent: Double?, val batteryPlugged: Boolean,
+    val tempC: Double?, val uptimeS: Long,
+    val top: List<ProcInfo>,
+)
+
 /** Stockage léger : hôte, port, jeton, empreinte épinglée, identifiant d'appareil. */
 class Store(ctx: Context) {
     private val p = ctx.getSharedPreferences("hub", Context.MODE_PRIVATE)
@@ -45,6 +59,8 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
     /** Rappels appelés depuis un thread réseau : l'appelant doit repasser sur le thread UI. */
     @Volatile var onActions: ((List<ActionItem>) -> Unit)? = null
     @Volatile var onActionResult: ((actionId: String, code: String) -> Unit)? = null
+    @Volatile var onStats: ((PcStats) -> Unit)? = null
+    @Volatile var onStatsError: ((code: String) -> Unit)? = null
 
     private fun set(s: ConnState, msg: String = "") { state = s; onState(s, msg) }
 
@@ -110,9 +126,11 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
                         })
                     }
                     "action_result" -> onActionResult?.invoke(m.optString("action_id"), m.optString("code"))
+                    "stats" -> onStats?.invoke(parseStats(m))
                     "error" -> {
                         // Une erreur sur un message isolé (ex. touche refusée) ne doit pas couper la session
                         val code = m.optString("code")
+                        if (code == "stats_unavailable") onStatsError?.invoke(code)
                         if (code in setOf("auth_failed", "pair_failed", "unauthenticated")) set(ConnState.ERROR, code)
                     }
                 }
@@ -137,6 +155,35 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
     fun text(s: String) {
         if (state != ConnState.READY || s.isEmpty()) return
         s.chunked(256).forEach { send("text", "text" to it) }
+    }
+
+    /** Demande ponctuelle : le téléphone décide de la fréquence (économie de batterie et de réseau). */
+    fun requestStats(top: Int = 5) {
+        if (state == ConnState.READY) send("stats_request", "top" to top)
+    }
+
+    private fun parseStats(m: JSONObject): PcStats {
+        val mem = m.getJSONObject("mem")
+        val net = m.getJSONObject("net")
+        val battery = m.optJSONObject("battery")
+        val disks = m.optJSONArray("disks") ?: JSONArray()
+        val top = m.optJSONArray("top") ?: JSONArray()
+        return PcStats(
+            cpu = m.getDouble("cpu"), cores = m.optInt("cores", 1),
+            memPercent = mem.getDouble("percent"), memUsedMb = mem.getInt("used_mb"), memTotalMb = mem.getInt("total_mb"),
+            disks = (0 until disks.length()).map {
+                val d = disks.getJSONObject(it)
+                DiskInfo(d.getString("mount"), d.getDouble("percent"), d.getDouble("free_gb"), d.getDouble("total_gb"))
+            },
+            upKbps = net.getDouble("up_kbps"), downKbps = net.getDouble("down_kbps"),
+            batteryPercent = battery?.getDouble("percent"), batteryPlugged = battery?.optBoolean("plugged") ?: false,
+            tempC = if (m.has("temp_c") && !m.isNull("temp_c")) m.getDouble("temp_c") else null,
+            uptimeS = m.optLong("uptime_s"),
+            top = (0 until top.length()).map {
+                val p = top.getJSONObject(it)
+                ProcInfo(p.getString("name"), p.getDouble("cpu"), p.getInt("mem_mb"))
+            },
+        )
     }
 
     fun runAction(id: String, confirmed: Boolean = false) {
