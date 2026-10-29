@@ -2,6 +2,7 @@ package com.a10hub.networking
 
 import android.content.Context
 import okhttp3.*
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -13,6 +14,9 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 
 enum class ConnState { DISCONNECTED, CONNECTING, PAIRING, READY, ERROR }
+
+/** Action autorisée annoncée par le PC (identifiant + libellé ; rien d'exécutable ne transite). */
+data class ActionItem(val id: String, val label: String, val sensitive: Boolean, val page: String)
 
 /** Stockage léger : hôte, port, jeton, empreinte épinglée, identifiant d'appareil. */
 class Store(ctx: Context) {
@@ -37,6 +41,10 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
     private var ws: WebSocket? = null
     @Volatile private var seenFp = ""
     @Volatile var state = ConnState.DISCONNECTED; private set
+
+    /** Rappels appelés depuis un thread réseau : l'appelant doit repasser sur le thread UI. */
+    @Volatile var onActions: ((List<ActionItem>) -> Unit)? = null
+    @Volatile var onActionResult: ((actionId: String, code: String) -> Unit)? = null
 
     private fun set(s: ConnState, msg: String = "") { state = s; onState(s, msg) }
 
@@ -91,9 +99,22 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
                     "paired" -> {
                         store.token = m.getString("token"); store.fingerprint = seenFp; store.pcName = m.optString("pc_name")
                         set(ConnState.READY, store.pcName)
+                        send("actions_list")
                     }
-                    "ready" -> set(ConnState.READY, m.optString("pc_name"))
-                    "error" -> set(ConnState.ERROR, m.optString("code"))
+                    "ready" -> { set(ConnState.READY, m.optString("pc_name")); send("actions_list") }
+                    "actions" -> {
+                        val arr = m.optJSONArray("items") ?: JSONArray()
+                        onActions?.invoke((0 until arr.length()).map {
+                            val o = arr.getJSONObject(it)
+                            ActionItem(o.getString("id"), o.getString("label"), o.optBoolean("sensitive"), o.optString("page", "Actions"))
+                        })
+                    }
+                    "action_result" -> onActionResult?.invoke(m.optString("action_id"), m.optString("code"))
+                    "error" -> {
+                        // Une erreur sur un message isolé (ex. touche refusée) ne doit pas couper la session
+                        val code = m.optString("code")
+                        if (code in setOf("auth_failed", "pair_failed", "unauthenticated")) set(ConnState.ERROR, code)
+                    }
                 }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = set(ConnState.ERROR, t.message ?: "Connexion perdue")
@@ -106,4 +127,19 @@ class HubClient(private val store: Store, private val onState: (ConnState, Strin
     fun move(dx: Int, dy: Int) { if (state == ConnState.READY && (dx != 0 || dy != 0)) send("mouse_move", "dx" to dx, "dy" to dy) }
     fun button(button: String, action: String) { if (state == ConnState.READY) send("mouse_button", "button" to button, "action" to action) }
     fun scroll(dy: Int, dx: Int = 0) { if (state == ConnState.READY && (dx != 0 || dy != 0)) send("scroll", "dx" to dx, "dy" to dy) }
+
+    /** Appui de touche ; [mods] parmi ctrl, alt, shift, win. */
+    fun key(key: String, mods: List<String> = emptyList()) {
+        if (state == ConnState.READY) send("key", "key" to key, "mods" to JSONArray(mods), "action" to "press")
+    }
+
+    /** Saisie de texte Unicode, découpée en morceaux de 256 caractères (limite du protocole). */
+    fun text(s: String) {
+        if (state != ConnState.READY || s.isEmpty()) return
+        s.chunked(256).forEach { send("text", "text" to it) }
+    }
+
+    fun runAction(id: String, confirmed: Boolean = false) {
+        if (state == ConnState.READY) send("action", "action_id" to id, "confirmed" to confirmed)
+    }
 }
