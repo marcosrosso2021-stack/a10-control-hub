@@ -12,11 +12,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.a10hub.airmouse.AirMouseScreen
 import com.a10hub.keyboard.KeyboardScreen
 import com.a10hub.macros.CommandPanel
 import com.a10hub.networking.ActionItem
+import com.a10hub.monitoring.MonitoringScreen
 import com.a10hub.networking.ConnState
 import com.a10hub.networking.HubClient
+import com.a10hub.networking.PcStats
 import com.a10hub.networking.Store
 import com.a10hub.touchpad.Touchpad
 import com.a10hub.touchpad.TouchpadSettings
@@ -36,6 +39,10 @@ class MainActivity : ComponentActivity() {
         client = HubClient(store) { s, m -> runOnUiThread { stateHolder = s to m } }
         var actions by mutableStateOf(emptyList<ActionItem>())
         var lastResult by mutableStateOf("")
+        var stats by mutableStateOf<PcStats?>(null)
+        var statsUnavailable by mutableStateOf(false)
+        client.onStats = { s -> runOnUiThread { stats = s; statsUnavailable = false } }
+        client.onStatsError = { runOnUiThread { statsUnavailable = true } }
         client.onActions = { list -> runOnUiThread { actions = list } }
         client.onActionResult = { id, code ->
             runOnUiThread {
@@ -53,7 +60,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme(primary = Accent, background = Bg, surface = Bg)) {
                 Surface(Modifier.fillMaxSize(), color = Bg) {
                     val (state, msg) = stateHolder
-                    if (state == ConnState.READY) HubScreen(client, store, state, actions, lastResult)
+                    if (state == ConnState.READY) HubScreen(client, store, state, actions, lastResult, stats, statsUnavailable)
                     else ConnectScreen(store, state, msg, client)
                 }
             }
@@ -104,7 +111,10 @@ private fun ConnectScreen(store: Store, state: ConnState, msg: String, client: H
 }
 
 @Composable
-private fun HubScreen(client: HubClient, store: Store, state: ConnState, actions: List<ActionItem>, lastResult: String) {
+private fun HubScreen(
+    client: HubClient, store: Store, state: ConnState, actions: List<ActionItem>, lastResult: String,
+    stats: PcStats?, statsUnavailable: Boolean,
+) {
     val settingsState = remember { mutableStateOf(TouchpadSettings()) }
     var tab by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize().padding(12.dp)) {
@@ -114,16 +124,18 @@ private fun HubScreen(client: HubClient, store: Store, state: ConnState, actions
             Text("Connecté à ${store.pcName}", color = Color.White, modifier = Modifier.weight(1f))
             TextButton(onClick = { client.disconnect() }) { Text("Quitter") }
         }
-        TabRow(selectedTabIndex = tab) {
-            listOf("Souris", "Clavier", "Commandes").forEachIndexed { i, t ->
+        ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
+            listOf("Souris", "Air Mouse", "Clavier", "Commandes", "Moniteur").forEachIndexed { i, t ->
                 Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) })
             }
         }
         Spacer(Modifier.height(8.dp))
         when (tab) {
             0 -> MouseTab(client, settingsState, Modifier.weight(1f).fillMaxWidth())
-            1 -> KeyboardScreen(client, Modifier.weight(1f).fillMaxWidth())
-            else -> CommandPanel(client, actions, lastResult, Modifier.weight(1f).fillMaxWidth())
+            1 -> AirMouseScreen(client, Modifier.weight(1f).fillMaxWidth())
+            2 -> KeyboardScreen(client, Modifier.weight(1f).fillMaxWidth())
+            3 -> CommandPanel(client, actions, lastResult, Modifier.weight(1f).fillMaxWidth())
+            else -> MonitoringScreen(client, stats, statsUnavailable, Modifier.weight(1f).fillMaxWidth())
         }
     }
 }
